@@ -1,0 +1,136 @@
+stTradeSent) {
+    s.firstTradeSent = true;
+    const ctx = await blockContext(log.blockNumber);
+    const ev = {
+      ...ctx, block_number: Number(log.blockNumber), tx_hash: log.transactionHash,
+      token_ca: safeAddress(token), symbol, pair: safeAddress(pair), quote_token: safeAddress(q.address), quote_symbol: q.symbol,
+      pool_id: s.poolId || '', hook: s.hook || '', dex_version: s.dexVersion || '', first_swap_tx: log.transactionHash, direction
+    };
+    await post('FIRST_SWAP', ev).catch(() => {});
+    await maybePromoteCanary(s, ev);
+  }
+}
+
+async function processV3Logs(logs, pool, token, symbol, q, tokenIs0) {
+  for (const log of logs) {
+    const tokenAmt = tokenIs0 ? log.args.amount0 : log.args.amount1;
+    await recordTrade({ token, symbol, pair: pool, q, log, direction: tokenAmt < 0n ? 'buy' : 'sell' });
+  }
+}
+
+async function processCurveLogs(logs, curve, token, symbol, q, side) {
+  for (const log of logs) await recordTrade({ token, symbol, pair: curve, q, log, direction: side });
+}
+
+async function backfillLaunchV3(pool, token, symbol, q, tokenIs0, blockNumber, txHash) {
+  if (blockNumber == null || !txHash) return;
+  const logs = await httpClient.getLogs({ address: safeAddress(pool), event: v3Swap, fromBlock: blockNumber, toBlock: blockNumber }).catch(() => []);
+  const sameTx = logs.filter(x => lc(x.transactionHash) === lc(txHash));
+  if (sameTx.length) await processV3Logs(sameTx, pool, token, symbol, q, tokenIs0);
+}
+
+async function backfillLaunchCurve(curve, token, symbol, q, blockNumber, txHash) {
+  if (blockNumber == null || !txHash) return;
+  const [buys, sells] = await Promise.all([
+    httpClient.getLogs({ address: safeAddress(curve), event: curveBuy, fromBlock: blockNumber, toBlock: blockNumber }).catch(() => []),
+    httpClient.getLogs({ address: safeAddress(curve), event: curveSell, fromBlock: blockNumber, toBlock: blockNumber }).catch(() => [])
+  ]);
+  const f = xs => xs.filter(x => lc(x.transactionHash) === lc(txHash));
+  await processCurveLogs(f(buys), curve, token, symbol, q, 'buy');
+  await processCurveLogs(f(sells), curve, token, symbol, q, 'sell');
+}
+
+function markEventOnce(log, tag) {
+  const k = `${tag}:${lc(log?.transactionHash)}:${String(log?.logIndex ?? '')}`;
+  if (seenEventLogs.has(k)) return false;
+  seenEventLogs.add(k);
+  if (seenEventLogs.size > 20000) {
+    const keep = [...seenEventLogs].slice(-10000);
+    seenEventLogs.clear();
+    keep.forEach(x => seenEventLogs.add(x));
+  }
+  return true;
+}
+
+async function scheduleSnapshots(token) {
+  const ca = lc(token);
+  const first = state.get(ca);
+  if (!first || first.snapshotsScheduled) return;
+  first.snapshotsScheduled = true;
+  for (const delay of [15_000, 60_000]) {
+    setTimeout(async () => {
+      const s = state.get(ca); if (!s) return;
+      const [d, h] = await Promise.all([
+        dexscreener(s.token),
+        delay === 60_000 ? holderEnrichment(s.token, [s.pair, s.curve]) : Promise.resolve({})
+      ]);
+      await post('MINUTE_1_SNAPSHOT', {
+        event_time: nowIso(), token_ca: s.token, symbol: s.symbol || '',
+        pair: d.pair || s.pair || '', quote_token: s.quoteToken || '', quote_symbol: s.quoteSymbol || '',
+        pool_id: s.poolId || '', hook: s.hook || '', dex_version: s.dexVersion || '',
+        trades_1m: s.trades, buys_1m: s.buys, sells_1m: s.sells,
+        price_usd: d.price_usd || '', market_cap: d.market_cap || '', liquidity_usd: d.liquidity_usd || '',
+        holder_count: h.holder_count || '', top10_pct: h.top10_pct || '',
+        notes: delay === 60_000 ? '1m snapshot + Blockscout holder enrichment' : '15s enrichment'
+      }).catch(() => {});
+
+      if (s.stage === 'Canary') {
+        await post('CANARY_TRACK', {
+          event_time: nowIso(), token_ca: s.token, symbol: s.symbol || '', source: s.source || '', stage: 'Canary',
+          pool_id: s.poolId || '', hook: s.hook || '', dex_version: s.dexVersion || '',
+          price_usd: d.price_usd || '', market_cap: d.market_cap || '', liquidity_usd: d.liquidity_usd || '',
+          volume_5m: d.volume_5m || '', buys_5m: d.buys_5m || '', sells_5m: d.sells_5m || '',
+          notes: delay === 60_000 ? 'Canary 1m follow-up' : 'Canary 15s follow-up'
+        }).catch(() => {});
+      }
+
+      if (delay === 60_000) {
+        await post('SAFETY_RESULT', {
+          event_time: nowIso(), token_ca: s.token, symbol: s.symbol || '', deployer: safeAddress(s.deployer || ''),
+          holder_count: h.holder_count || '', top10_pct: h.top10_pct || '',
+          safety_status: s.trustedPons ? '待核' : '待核',
+          notes: s.trustedPons
+            ? 'Pons 已核 launch 来源；已补 Holder/Top10。权限、可卖性与关键钱包仍需继续核验。'
+            : '已补 Holder/Top10；Direct/Unknown 项目保持待核。'
+        }).catch(() => {});
+      }
+    }, delay).unref?.();
+  }
+}
+
+async function onPoolsTradeTokenCreated(log, source) {
+  if (!markEventOnce(log, `pools-trade:${source}`)) return;
+  const token = log.args.tokenAddress;
+  if (!token || lc(token) === lc(zeroAddress)) return;
+  const ctx = await blockContext(log.blockNumber);
+  const [m, tx] = await Promise.all([
+    tokenMeta(token),
+    httpClient.getTransaction({ hash: log.transactionHash }).catch(() => null)
+  ]);
+  const existing = state.get(lc(token));
+  const s = ensureState(token, {
+    symbol: m.symbol, source: 'pools.trade', deployer: tx?.from || existing?.deployer || '',
+    trustedPons: false, dexVersion: existing?.dexVersion || 'V4 pending', discoveryBlock: log.blockNumber
+  });
+  console.log('[DISCOVERY] pools.trade', source, m.symbol, token, `lag=${ctx.age_seconds}s`);
+  await post('TOKEN_DISCOVERED', {
+    ...ctx, block_number: Number(log.blockNumber), tx_hash: log.transactionHash,
+    token_ca: safeAddress(token), symbol: m.symbol, source: 'pools.trade', launchpad: 'pools.trade',
+    deployer: safeAddress(tx?.from || ''), stock_pair: '待识别', dex_version: 'V4 pending',
+    discovery_tx: log.transactionHash, mechanism_tags: `Uniswap LiquidityLauncher:${source}`, stage: 'Discovery',
+    notes: 'TokenCreated 早于或等于 V4 建池；等待 PoolManager Initialize / 首次 Swap 补全。'
+  });
+  s.discoveredAt = s.discoveredAt || Date.now();
+}
+
+async function onPonsV1Launch(log, source) {
+  if (!markEventOnce(log, `pons-v1:${source}`)) return;
+  const { token, deployer, pairToken, pool } = log.args;
+  const ctx = await blockContext(log.blockNumber);
+  const [m, q] = await Promise.all([tokenMeta(token), quoteMeta(pairToken)]);
+  const s = ensureState(token, { symbol: m.symbol, source, deployer, pair: safeAddress(pool), quoteToken: safeAddress(pairToken), quoteSymbol: q.symbol, trustedPons: true, dexVersion: 'V3', discoveryBlock: log.blockNumber });
+  console.log('[DISCOVERY]', source, m.symbol, token, 'pool', pool, `lag=${ctx.age_seconds}s`);
+  await post('TOKEN_DISCOVERED', {
+    ...ctx, block_number: Number(log.blockNumber), tx_hash: log.transactionHash,
+    token_ca: safeAddress(token), symbol: m.symbol, source, launchpad: 'Pons', deployer: safeAddress(deployer),
+    pair: safeAddress(pool), quote_token: safeAddress(pai
