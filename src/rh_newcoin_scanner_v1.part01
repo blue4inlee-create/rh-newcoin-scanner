@@ -1,0 +1,141 @@
+/**
+ * Robinhood Chain 新币实时扫描器 v1.0
+ * 目标：Discovery 先于完整验证，捕获 Pons v1/v2 新 launch、V3 WETH 新池、首次成交，并在 1 分钟后补快照。
+ *
+ * npm i viem dotenv
+ * node rh_newcoin_scanner_v1.mjs
+ */
+import 'dotenv/config';
+import { createServer } from 'node:http';
+import {
+  createPublicClient, http, webSocket, parseAbi, parseAbiItem,
+  zeroAddress, formatUnits, getAddress
+} from 'viem';
+
+const VERSION = 'rh-newcoin-scanner-v1.6.3';
+const CHAIN_ID = 4663;
+const HTTP_URL = process.env.RH_HTTP_URL || 'https://rpc.mainnet.chain.robinhood.com';
+const WS_URL = process.env.RH_WS_URL || '';
+const DRY_RUN = /^(1|true|yes)$/i.test(String(process.env.DRY_RUN || ''));
+const WEBHOOK_URL = process.env.SHEET_WEBHOOK_URL || '';
+const SECRET = process.env.SHEET_INGEST_SECRET || '';
+const PORT = Number(process.env.PORT || 3000);
+const BACKFILL_BLOCKS = BigInt(process.env.BACKFILL_BLOCKS || '120');
+if (!DRY_RUN && !WEBHOOK_URL) throw new Error('Missing SHEET_WEBHOOK_URL');
+if (!DRY_RUN && !SECRET) throw new Error('Missing SHEET_INGEST_SECRET');
+
+const chain = {
+  id: CHAIN_ID, name: 'Robinhood Chain', nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
+  rpcUrls: { default: { http: [HTTP_URL], webSocket: [WS_URL] } }
+};
+const httpClient = createPublicClient({ chain, pollingInterval: 2000, transport: http(HTTP_URL, { timeout: 15_000, retryCount: 2 }) });
+const liveClient = WS_URL
+  ? createPublicClient({ chain, transport: webSocket(WS_URL, { keepAlive: true }) })
+  : httpClient; // 无 WebSocket key 时可用公共 RPC 轮询做功能验证，生产环境仍建议 WebSocket。
+
+const ADDR = Object.freeze({
+  PONS_CURRENT: '0xA5aAb3F0c6EeadF30Ef1D3Eb997108E976351feB',
+  PONS_LEGACY: '0x0c37a24F5D23A486FA692d1500881d698B1F77a4',
+  PONS_V2: '0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e',
+  POOLS_TRADE_CURRENT: '0x0000FffFBE8efE702c8703aE3477FF5dE3d319C0',
+  POOLS_TRADE_ORIGINAL: '0x00004c4ccc709Ef590F7C81102C0689F0263D4e9',
+  V3_FACTORY: '0x1f7d7550B1b028f7571E69A784071F0205FD2EfA',
+  V4_POOL_MANAGER: '0x8366a39CC670B4001A1121B8F6A443A643e40951',
+  WETH: '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73',
+  USDG: '0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168',
+});
+const WETH = ADDR.WETH.toLowerCase();
+const USDG = ADDR.USDG.toLowerCase();
+const STOCK_ASSETS_URL = 'https://api.robinhood.com/rhj/assets';
+const BLOCKSCOUT_API = process.env.BLOCKSCOUT_API || 'https://robinhoodchain.blockscout.com/api/v2';
+const stockTokens = new Map(); // lower-case address -> official Robinhood Stock Token symbol
+
+const erc20Abi = parseAbi([
+  'function name() view returns (string)', 'function symbol() view returns (string)',
+  'function decimals() view returns (uint8)', 'function totalSupply() view returns (uint256)'
+]);
+const v3PoolAbi = parseAbi(['function token0() view returns (address)', 'function token1() view returns (address)']);
+const v2CurveAbi = parseAbi([
+  'function getReserves() view returns (uint256 quoteReserve, uint256 tokenReserve)',
+  'function pairToken() view returns (address)'
+]);
+
+const poolsTradeTokenCreated = parseAbiItem('event TokenCreated(address indexed tokenAddress)');
+const ponsV1Launch = parseAbiItem('event TokenLaunched(address indexed token, address indexed deployer, address indexed dexFactory, address pairToken, address pool, uint256 dexId, uint256 launchConfigId, uint256 positionId, uint256 restrictionsEndBlock, uint256 initialBuyAmount)');
+const ponsV2Launch = parseAbiItem('event TokenLaunched(address indexed token, address indexed curve, address indexed deployer, address pairToken, uint256 launchConfigId, uint256 graduationThreshold)');
+const curveBuy = parseAbiItem('event CurveBuy(address indexed buyer, address indexed recipient, uint256 quoteIn, uint256 tokensOut, uint256 fee, uint256 tax)');
+const curveSell = parseAbiItem('event CurveSell(address indexed seller, address indexed recipient, uint256 tokensIn, uint256 quoteOut, uint256 fee, uint256 tax)');
+const v3PoolCreated = parseAbiItem('event PoolCreated(address indexed token0, address indexed token1, uint24 indexed fee, int24 tickSpacing, address pool)');
+const v3Swap = parseAbiItem('event Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)');
+const v4Initialize = parseAbiItem('event Initialize(bytes32 indexed id, address indexed currency0, address indexed currency1, uint24 fee, int24 tickSpacing, address hooks, uint160 sqrtPriceX96, int24 tick)');
+const v4Swap = parseAbiItem('event Swap(bytes32 indexed id, address indexed sender, int128 amount0, int128 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick, uint24 fee)');
+
+const state = new Map(); // ca -> discovery/trade state
+const watchedPools = new Set();
+const watchedCurves = new Set();
+const v4Pools = new Map(); // poolId(lowercase) -> { token, symbol, q, tokenIs0, hook }
+const seenTradeLogs = new Set();
+let latestBlock = 0n;
+let reconnectCount = 0;
+let queueSize = 0;
+let lastError = '';
+let lastDiscoveryWrite = '';
+let lastLag = 0;
+let ready = false;
+let webhookOk = false;
+const startedAt = Date.now();
+const unwatchers = [];
+const seenEventLogs = new Set();
+
+const nowIso = () => new Date().toISOString();
+const lc = x => String(x || '').toLowerCase();
+const safeAddress = x => { try { return getAddress(x); } catch { return String(x || ''); } };
+const BACKFILL_RPC_GAP_MS = Number(process.env.BACKFILL_RPC_GAP_MS || 220);
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+function isRateLimitError(e) {
+  const t = String(e?.message || e || '');
+  return e?.status === 429 || e?.statusCode === 429 || /(^|\D)429(\D|$)|Too Many Requests/i.test(t);
+}
+
+async function backfillGetLogs(args, label = 'getLogs') {
+  const waits = [0, 450, 1200, 2500];
+  let last;
+  for (let i = 0; i < waits.length; i++) {
+    if (waits[i]) await sleep(waits[i]);
+    try {
+      const out = await httpClient.getLogs(args);
+      if (BACKFILL_RPC_GAP_MS > 0) await sleep(BACKFILL_RPC_GAP_MS);
+      return out;
+    } catch (e) {
+      last = e;
+      if (!isRateLimitError(e) || i === waits.length - 1) throw e;
+      console.warn(`[backfill-rate-limit] ${label} retry=${i + 1}`);
+    }
+  }
+  throw last;
+}
+
+async function runBackfillSource(label, getLogsArgs, handler) {
+  try {
+    const logs = await backfillGetLogs(getLogsArgs, label);
+    for (const log of logs) await handler(log);
+    return { label, ok: true, count: logs.length };
+  } catch (e) {
+    console.warn('[backfill-source]', label, String(e?.message || e));
+    return { label, ok: false, count: 0, error: String(e?.message || e) };
+  }
+}
+
+async function post(event_type, body = {}) {
+  queueSize++;
+  try {
+    if (DRY_RUN) {
+      if (event_type !== 'HEARTBEAT') {
+        console.log('[dry-run]', event_type, body.symbol || '', body.token_ca || '', body.tx_hash || body.discovery_tx || '');
+      }
+      return { ok: true, dry_run: true };
+    }
+    const res = await fetch(WEBHOOK_URL, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ secret: S
