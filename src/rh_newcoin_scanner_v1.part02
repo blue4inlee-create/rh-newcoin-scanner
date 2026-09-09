@@ -1,0 +1,146 @@
+ECRET, event_type, ...body })
+    });
+    const text = await res.text();
+    if (!res.ok) throw new Error(`Webhook HTTP ${res.status}: ${text.slice(0, 500)}`);
+    let parsed; try { parsed = JSON.parse(text); } catch { parsed = { raw: text }; }
+    if (parsed && parsed.ok === false) throw new Error(`Webhook rejected: ${parsed.error || text}`);
+    if (event_type === 'TOKEN_DISCOVERED' || event_type === 'POOL_CREATED') lastDiscoveryWrite = nowIso();
+    webhookOk = true;
+    return parsed;
+  } catch (e) {
+    lastError = String(e?.message || e);
+    console.error('[webhook]', event_type, lastError);
+    throw e;
+  } finally { queueSize--; }
+}
+
+async function blockContext(blockNumber) {
+  const b = await httpClient.getBlock({ blockNumber });
+  const blockMs = Number(b.timestamp) * 1000;
+  const lag = Math.max(0, (Date.now() - blockMs) / 1000);
+  lastLag = lag;
+  return { event_time: new Date(blockMs).toISOString(), age_seconds: Number(lag.toFixed(2)) };
+}
+
+async function tokenMeta(token) {
+  const t = safeAddress(token);
+  const [name, symbol, decimals, totalSupply] = await Promise.all([
+    httpClient.readContract({ address: t, abi: erc20Abi, functionName: 'name' }).catch(() => ''),
+    httpClient.readContract({ address: t, abi: erc20Abi, functionName: 'symbol' }).catch(() => ''),
+    httpClient.readContract({ address: t, abi: erc20Abi, functionName: 'decimals' }).catch(() => 18),
+    httpClient.readContract({ address: t, abi: erc20Abi, functionName: 'totalSupply' }).catch(() => 0n),
+  ]);
+  return { name: String(name || ''), symbol: String(symbol || ''), decimals: Number(decimals), totalSupply };
+}
+
+async function refreshStockRegistry() {
+  try {
+    const r = await fetch(STOCK_ASSETS_URL, { headers: { accept: 'application/json' } });
+    if (!r.ok) throw new Error(`Stock Token API HTTP ${r.status}`);
+    const j = await r.json();
+    const next = new Map();
+    for (const asset of (j.assets || [])) {
+      for (const dep of (asset.deployments || [])) {
+        if (Number(dep.chainId) !== CHAIN_ID || !dep.contractAddress) continue;
+        next.set(lc(dep.contractAddress), String(asset.tokenSymbol || asset.tokenName || 'STOCK'));
+      }
+    }
+    stockTokens.clear();
+    for (const [k,v] of next) stockTokens.set(k,v);
+    console.log(`[stock-registry] loaded ${stockTokens.size} canonical Stock Tokens`);
+  } catch (e) {
+    lastError = `stock registry: ${String(e?.message || e)}`;
+    console.warn(lastError);
+  }
+}
+
+async function quoteMeta(pairToken) {
+  if (!pairToken || lc(pairToken) === lc(zeroAddress)) return { address: zeroAddress, symbol: 'ETH', decimals: 18, stock_pair: '否' };
+  const a = lc(pairToken);
+  if (a === WETH) return { address: ADDR.WETH, symbol: 'WETH', decimals: 18, stock_pair: '否' };
+  if (a === USDG) return { address: ADDR.USDG, symbol: 'USDG', decimals: 18, stock_pair: '否' };
+  if (stockTokens.has(a)) return { address: pairToken, symbol: stockTokens.get(a), decimals: 18, stock_pair: '是' };
+  const m = await tokenMeta(pairToken);
+  const obviousNonStock = /^(USDC|USDT|USDG|DAI|WETH|ETH)$/i.test(m.symbol);
+  return { address: pairToken, symbol: m.symbol || pairToken, decimals: m.decimals, stock_pair: obviousNonStock ? '否' : '待识别' };
+}
+
+function ensureState(token, seed = {}) {
+  const ca = lc(token);
+  if (!state.has(ca)) state.set(ca, { token: safeAddress(token), buys: 0, sells: 0, trades: 0, firstTradeSent: false, discoveredAt: Date.now(), stage: 'Discovery', trustedPons: false, ...seed });
+  else Object.assign(state.get(ca), seed);
+  return state.get(ca);
+}
+
+async function dexscreener(token) {
+  try {
+    const r = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${token}`, { headers: { accept: 'application/json' } });
+    if (!r.ok) return {};
+    const j = await r.json();
+    const pairs = (j.pairs || []).filter(p => Number(p.chainId) === CHAIN_ID || String(p.chainId).toLowerCase().includes('robinhood'));
+    const p = pairs.sort((a,b) => Number(b?.liquidity?.usd || 0) - Number(a?.liquidity?.usd || 0))[0];
+    if (!p) return {};
+    return {
+      price_usd: Number(p.priceUsd || 0) || '', market_cap: Number(p.marketCap || p.fdv || 0) || '',
+      liquidity_usd: Number(p?.liquidity?.usd || 0) || '', pair: p.pairAddress || '',
+      volume_5m: Number(p?.volume?.m5 || 0) || '', buys_5m: Number(p?.txns?.m5?.buys || 0) || '', sells_5m: Number(p?.txns?.m5?.sells || 0) || ''
+    };
+  } catch { return {}; }
+}
+
+async function holderEnrichment(token, exclude = []) {
+  const excluded = new Set([lc(zeroAddress), lc(token), ...exclude.map(lc)]);
+  try {
+    const base = `${BLOCKSCOUT_API}/tokens/${safeAddress(token)}`;
+    const [countersRes, holdersRes, meta] = await Promise.all([
+      fetch(`${base}/counters`, { headers: { accept: 'application/json' } }),
+      fetch(`${base}/holders`, { headers: { accept: 'application/json' } }),
+      tokenMeta(token)
+    ]);
+    const counters = countersRes.ok ? await countersRes.json() : {};
+    const holders = holdersRes.ok ? await holdersRes.json() : {};
+    const holderCount = Number(counters.token_holders_count || counters.holders_count || 0) || '';
+    let sum = 0n;
+    let n = 0;
+    for (const item of (holders.items || [])) {
+      const addr = lc(item?.address?.hash || item?.address_hash?.hash || item?.address_hash || item?.address || '');
+      if (!addr || excluded.has(addr)) continue;
+      const raw = item?.value ?? item?.balance ?? item?.quantity;
+      try {
+        const v = BigInt(String(raw || '0'));
+        if (v <= 0n) continue;
+        sum += v;
+        if (++n >= 10) break;
+      } catch {}
+    }
+    const supply = meta.totalSupply || 0n;
+    const top10Pct = supply > 0n ? Number(sum * 1_000_000n / supply) / 10_000 : '';
+    return { holder_count: holderCount, top10_pct: top10Pct };
+  } catch (e) {
+    lastError = `holder enrichment ${token}: ${String(e?.message || e)}`;
+    return {};
+  }
+}
+
+async function maybePromoteCanary(s, firstTrade) {
+  if (!s?.trustedPons || s.stage !== 'Discovery') return;
+  s.stage = 'Canary';
+  const d = await dexscreener(s.token);
+  await post('STAGE_CHANGE', {
+    event_time: firstTrade.event_time || nowIso(), token_ca: s.token, symbol: s.symbol || '', source: s.source || 'Pons',
+    old_stage: 'Discovery', new_stage: 'Canary',
+    trigger: '可信 Pons launch + 首次真实成交',
+    evidence: `${s.source || 'Pons'} 已核来源；链上出现首次 ${firstTrade.direction || 'swap'}；quote=${s.quoteSymbol || ''}`,
+    price_usd: d.price_usd || '', market_cap: d.market_cap || '', liquidity_usd: d.liquidity_usd || '',
+    notes: 'Canary 仅代表允许极小仓观察；合约与集中度继续异步核验。'
+  }).catch(() => {});
+}
+
+async function recordTrade({ token, symbol, pair, q, log, direction }) {
+  const k = `${lc(log.transactionHash)}:${String(log.logIndex ?? '')}:${direction}`;
+  if (seenTradeLogs.has(k)) return;
+  seenTradeLogs.add(k);
+  const s = ensureState(token, { symbol, pair: safeAddress(pair), quoteToken: q.address, quoteSymbol: q.symbol });
+  s.trades++;
+  if (direction === 'buy') s.buys++; else s.sells++;
+  if (!s.fir
