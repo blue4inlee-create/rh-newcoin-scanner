@@ -1,0 +1,112 @@
+) || '';
+  const stock1 = stockTokens.get(a1) || '';
+
+  let token = '', q = null, tokenIs0 = false;
+  if (a0 === z) {
+    token = currency1; tokenIs0 = false; q = { address: zeroAddress, symbol: 'ETH', decimals: 18, stock_pair: '否' };
+  } else if (a1 === z) {
+    token = currency0; tokenIs0 = true; q = { address: zeroAddress, symbol: 'ETH', decimals: 18, stock_pair: '否' };
+  } else if (a0 === WETH) {
+    token = currency1; tokenIs0 = false; q = { address: ADDR.WETH, symbol: 'WETH', decimals: 18, stock_pair: '否' };
+  } else if (a1 === WETH) {
+    token = currency0; tokenIs0 = true; q = { address: ADDR.WETH, symbol: 'WETH', decimals: 18, stock_pair: '否' };
+  } else if (a0 === USDG) {
+    token = currency1; tokenIs0 = false; q = { address: ADDR.USDG, symbol: 'USDG', decimals: 6, stock_pair: '否' };
+  } else if (a1 === USDG) {
+    token = currency0; tokenIs0 = true; q = { address: ADDR.USDG, symbol: 'USDG', decimals: 6, stock_pair: '否' };
+  } else if (stock0 && !stock1) {
+    token = currency1; tokenIs0 = false; q = { address: currency0, symbol: stock0, decimals: 18, stock_pair: '是' };
+  } else if (stock1 && !stock0) {
+    token = currency0; tokenIs0 = true; q = { address: currency1, symbol: stock1, decimals: 18, stock_pair: '是' };
+  } else {
+    return;
+  }
+
+  if (stockTokens.has(lc(token)) || lc(token) === WETH || lc(token) === USDG || lc(token) === z) return;
+  const poolId = String(id);
+  const existing = state.get(lc(token));
+  if (existing?.poolId === poolId) return;
+  const isNewToken = !existing;
+
+  const ctx = await blockContext(log.blockNumber);
+  const m = await tokenMeta(token);
+  const s = ensureState(token, {
+    symbol: m.symbol, source: existing?.source || 'Uni V4 Initialize', pair: ADDR.V4_POOL_MANAGER,
+    poolId, hook: safeAddress(hooks), quoteToken: safeAddress(q.address), quoteSymbol: q.symbol, dexVersion: 'V4', discoveryBlock: existing?.discoveryBlock || log.blockNumber
+  });
+  v4Pools.set(lc(poolId), { token: safeAddress(token), symbol: m.symbol, q, tokenIs0, hook: safeAddress(hooks), discoveryBlock: log.blockNumber });
+  console.log(isNewToken ? '[DISCOVERY] Uni V4' : '[POOL-ENRICH] Uni V4', m.symbol, token, '/', q.symbol, poolId, `lag=${ctx.age_seconds}s`);
+  await post('POOL_CREATED', {
+    ...ctx, block_number: Number(log.blockNumber), tx_hash: log.transactionHash,
+    token_ca: safeAddress(token), symbol: m.symbol, source: 'Uni V4', launchpad: existing ? (existing.source || 'Existing') : 'Direct/Unknown',
+    pair: ADDR.V4_POOL_MANAGER, pool_id: poolId, hook: safeAddress(hooks), dex_version: 'V4', discovery_tx: log.transactionHash,
+    quote_token: safeAddress(q.address), quote_symbol: q.symbol, stock_pair: q.stock_pair,
+    mechanism_tags: `V4${hooks && lc(hooks) !== z ? ',hook' : ''}${q.stock_pair === '是' ? `,Stock Token pair:${q.symbol}` : ''};fee=${fee};tickSpacing=${tickSpacing}`
+  });
+  await backfillLaunchV4(poolId, log.blockNumber, log.transactionHash).catch(() => {});
+  if (isNewToken) scheduleSnapshots(token);
+  s.discoveredAt = s.discoveredAt || Date.now();
+}
+
+function startWatchers() {
+  const specs = [
+    [ADDR.POOLS_TRADE_CURRENT, poolsTradeTokenCreated, logs => Promise.all(logs.map(l => onPoolsTradeTokenCreated(l, 'Current')))],
+    [ADDR.POOLS_TRADE_ORIGINAL, poolsTradeTokenCreated, logs => Promise.all(logs.map(l => onPoolsTradeTokenCreated(l, 'Original')))],
+    [ADDR.PONS_CURRENT, ponsV1Launch, logs => Promise.all(logs.map(l => onPonsV1Launch(l, 'Pons Current')))],
+    [ADDR.PONS_LEGACY, ponsV1Launch, logs => Promise.all(logs.map(l => onPonsV1Launch(l, 'Pons Legacy')))],
+    [ADDR.PONS_V2, ponsV2Launch, logs => Promise.all(logs.map(onPonsV2Launch))],
+    [ADDR.V3_FACTORY, v3PoolCreated, logs => Promise.all(logs.map(onGenericV3Pool))],
+    [ADDR.V4_POOL_MANAGER, v4Initialize, logs => Promise.all(logs.map(onGenericV4Pool))],
+  ];
+  for (const [address, event, onLogs] of specs) {
+    const unwatch = liveClient.watchContractEvent({ address, event, onLogs, onError: e => { lastError = `${address}: ${String(e?.message || e)}`; reconnectCount++; } });
+    if (typeof unwatch === 'function') unwatchers.push(unwatch);
+  }
+  const unwatchBlocks = liveClient.watchBlocks({ emitMissed: true, onBlock: b => { latestBlock = b.number || latestBlock; }, onError: e => { lastError = `blocks: ${String(e?.message || e)}`; reconnectCount++; } });
+  if (typeof unwatchBlocks === 'function') unwatchers.push(unwatchBlocks);
+  const unwatchV4Swaps = liveClient.watchContractEvent({ address: ADDR.V4_POOL_MANAGER, event: v4Swap, onLogs: logs => processV4Logs(logs).catch(e => { lastError = `v4 swaps: ${String(e?.message || e)}`; }), onError: e => { lastError = `v4 swaps: ${String(e?.message || e)}`; reconnectCount++; } });
+  if (typeof unwatchV4Swaps === 'function') unwatchers.push(unwatchV4Swaps);
+}
+
+async function replayHistoricalTrades(from, head) {
+  // 先重建 launch/pool 状态，再把停机窗口里的首笔成交补回来。
+  let checked = 0;
+  let failures = 0;
+
+  for (const s of state.values()) {
+    const start = s.discoveryBlock != null && BigInt(s.discoveryBlock) > from ? BigInt(s.discoveryBlock) : from;
+    if (start > head) continue;
+    try {
+      if (s.curve) {
+        const buys = await backfillGetLogs({ address: safeAddress(s.curve), event: curveBuy, fromBlock: start, toBlock: head }, `${s.symbol || s.token}:curveBuy`);
+        const sells = await backfillGetLogs({ address: safeAddress(s.curve), event: curveSell, fromBlock: start, toBlock: head }, `${s.symbol || s.token}:curveSell`);
+        await processCurveLogs(buys, s.curve, s.token, s.symbol || '', { address: s.quoteToken, symbol: s.quoteSymbol || '', decimals: 18 }, 'buy');
+        await processCurveLogs(sells, s.curve, s.token, s.symbol || '', { address: s.quoteToken, symbol: s.quoteSymbol || '', decimals: 18 }, 'sell');
+        checked++;
+      } else if (s.dexVersion === 'V3' && s.pair && lc(s.pair) !== lc(ADDR.V4_POOL_MANAGER)) {
+        const logs = await backfillGetLogs({ address: safeAddress(s.pair), event: v3Swap, fromBlock: start, toBlock: head }, `${s.symbol || s.token}:v3Swap`);
+        await processV3Logs(logs, s.pair, s.token, s.symbol || '', { address: s.quoteToken, symbol: s.quoteSymbol || '', decimals: 18 }, Boolean(s.tokenIs0));
+        checked++;
+      }
+    } catch (e) {
+      failures++;
+      console.warn('[backfill-trades]', s.symbol || s.token, String(e?.message || e));
+    }
+  }
+
+  for (const [poolId, meta] of v4Pools) {
+    const start = meta.discoveryBlock != null && BigInt(meta.discoveryBlock) > from ? BigInt(meta.discoveryBlock) : from;
+    if (start > head) continue;
+    try {
+      const logs = await backfillGetLogs({
+        address: ADDR.V4_POOL_MANAGER, event: v4Swap, args: { id: poolId }, fromBlock: start, toBlock: head
+      }, `v4:${poolId}`);
+      await processV4Logs(logs);
+      checked++;
+    } catch (e) {
+      failures++;
+      console.warn('[backfill-trades] v4', poolId, String(e?.message || e));
+    }
+  }
+
+  console.log(`[backfill-trades] checked=${checked}, failed=${failures}`);
