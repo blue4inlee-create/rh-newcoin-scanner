@@ -1,8 +1,8 @@
 // Preload patch for Google Apps Script ContentService webhooks.
 // Apps Script executes the POST, then returns a 302 to script.googleusercontent.com.
-// Node fetch follows that redirect as GET, which can surface as a final 404 even though
-// the webhook write already succeeded. Keep the redirect manual and acknowledge only
-// the known Google ContentService redirect target.
+// Node fetch can mishandle that redirect for POST requests. Keep the POST redirect manual,
+// then explicitly GET the trusted ContentService Location so the scanner receives the real
+// JSON response, including any { ok:false } error returned by Apps Script.
 
 const nativeFetch = globalThis.fetch.bind(globalThis);
 
@@ -23,9 +23,10 @@ globalThis.fetch = async function patchedFetch(input, init) {
     } catch {}
 
     if (trustedRedirect) {
-      return new Response(JSON.stringify({ ok: true, apps_script_redirect: true }), {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
+      return nativeFetch(location, {
+        method: 'GET',
+        redirect: 'follow',
+        headers: { accept: 'application/json' },
       });
     }
   }
