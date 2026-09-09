@@ -1,0 +1,75 @@
+  if (failures) lastError = `trade backfill: ${failures} source(s) failed`;
+}
+
+async function backfillRecent() {
+  // Railway 重启/重新部署时回补最近区块，降低短暂离线造成的漏扫。
+  const head = await httpClient.getBlockNumber();
+  latestBlock = head;
+  const from = head > BACKFILL_BLOCKS ? head - BACKFILL_BLOCKS : 0n;
+  const specs = [
+    ['pools.trade Current', { address: ADDR.POOLS_TRADE_CURRENT, event: poolsTradeTokenCreated, fromBlock: from, toBlock: head }, l => onPoolsTradeTokenCreated(l, 'Current')],
+    ['pools.trade Original', { address: ADDR.POOLS_TRADE_ORIGINAL, event: poolsTradeTokenCreated, fromBlock: from, toBlock: head }, l => onPoolsTradeTokenCreated(l, 'Original')],
+    ['Pons Current', { address: ADDR.PONS_CURRENT, event: ponsV1Launch, fromBlock: from, toBlock: head }, l => onPonsV1Launch(l, 'Pons Current')],
+    ['Pons Legacy', { address: ADDR.PONS_LEGACY, event: ponsV1Launch, fromBlock: from, toBlock: head }, l => onPonsV1Launch(l, 'Pons Legacy')],
+    ['Pons V2', { address: ADDR.PONS_V2, event: ponsV2Launch, fromBlock: from, toBlock: head }, onPonsV2Launch],
+    ['Uni V3', { address: ADDR.V3_FACTORY, event: v3PoolCreated, fromBlock: from, toBlock: head }, onGenericV3Pool],
+    ['Uni V4', { address: ADDR.V4_POOL_MANAGER, event: v4Initialize, fromBlock: from, toBlock: head }, onGenericV4Pool],
+  ];
+  const results = [];
+  for (const [label, args, handler] of specs) results.push(await runBackfillSource(label, args, handler));
+  const failed = results.filter(x => !x.ok);
+  if (failed.length) lastError = `startup backfill: ${failed.length}/${results.length} sources failed`;
+  await replayHistoricalTrades(from, head);
+  console.log(`[backfill] blocks ${from}-${head}, sources=${results.length}, failed=${failed.length}, rpcGapMs=${BACKFILL_RPC_GAP_MS}`);
+}
+
+const healthServer = createServer((req, res) => {
+  if (req.url !== '/health' && req.url !== '/') {
+    res.writeHead(404, { 'content-type': 'application/json' });
+    return res.end(JSON.stringify({ ok: false, error: 'not_found' }));
+  }
+  const body = {
+    ok: ready, version: VERSION, chain_id: CHAIN_ID, latest_block: Number(latestBlock || 0n),
+    mode: WS_URL ? 'websocket' : 'http-polling', dry_run: DRY_RUN, webhook_ok: webhookOk,
+    event_lag_seconds: Number(lastLag.toFixed(2)), queue_size: queueSize,
+    tracked_tokens: state.size, watched_pools: watchedPools.size, watched_curves: watchedCurves.size, watched_v4_pools: v4Pools.size,
+    stock_tokens: stockTokens.size, uptime_seconds: Math.floor((Date.now() - startedAt) / 1000),
+    last_error: lastError || ''
+  };
+  res.writeHead(ready ? 200 : 503, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+  res.end(JSON.stringify(body));
+});
+healthServer.listen(PORT, '0.0.0.0', () => console.log(`[health] listening on 0.0.0.0:${PORT}`));
+
+function shutdown(signal) {
+  console.log(`[shutdown] ${signal}`);
+  ready = false;
+  for (const u of unwatchers.splice(0)) { try { u(); } catch {} }
+  healthServer.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 8000).unref?.();
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
+setInterval(() => {
+  post('HEARTBEAT', {
+    event_time: nowIso(), ok: true, latest_block: Number(latestBlock || 0n),
+    ws_provider: WS_URL ? (WS_URL.includes('alchemy.com') ? 'Alchemy WebSocket' : 'Custom WebSocket') : 'Public HTTP polling', ws_status: 'connected',
+    event_lag_seconds: Number(lastLag.toFixed(2)), reconnect_count: reconnectCount, queue_size: queueSize,
+    last_discovery_write: lastDiscoveryWrite, last_error: lastError, scanner_version: VERSION,
+    pools_trade_current_listener: '正常', pools_trade_original_listener: '正常',
+    pons_current_listener: '正常', pons_v2_listener: '正常', v3_listener: '正常', v4_listener: '正常'
+  }).catch(() => {});
+}, 30_000).unref?.();
+
+process.on('unhandledRejection', e => { lastError = `unhandledRejection: ${String(e)}`; console.error(lastError); });
+process.on('uncaughtException', e => { lastError = `uncaughtException: ${String(e?.stack || e)}`; console.error(lastError); });
+
+console.log(`${VERSION} starting on chain ${CHAIN_ID} mode=${DRY_RUN ? 'DRY_RUN' : 'LIVE'}`);
+await refreshStockRegistry();
+setInterval(refreshStockRegistry, 60 * 60 * 1000).unref?.();
+startWatchers();
+await backfillRecent();
+await post('HEARTBEAT', { event_time: nowIso(), ok: true, latest_block: Number(latestBlock || 0n), ws_provider: WS_URL ? (WS_URL.includes('alchemy.com') ? 'Alchemy WebSocket' : 'Custom WebSocket') : 'Public HTTP polling', ws_status: 'connected', reconnect_count: reconnectCount, queue_size: queueSize, scanner_version: VERSION }).catch(() => {});
+ready = true;
+console.log('watchers active');
