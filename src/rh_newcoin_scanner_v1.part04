@@ -1,0 +1,124 @@
+rToken), quote_symbol: q.symbol, stock_pair: q.stock_pair, dex_version: 'V3', discovery_tx: log.transactionHash, stage: 'Discovery'
+  });
+  const tokenIs0 = await watchV3Pool(pool, token, m.symbol, q).catch(e => { lastError = String(e?.message || e); return null; });
+  if (tokenIs0 != null) await backfillLaunchV3(pool, token, m.symbol, q, tokenIs0, log.blockNumber, log.transactionHash).catch(() => {});
+  scheduleSnapshots(token);
+  s.discoveredAt = Date.now();
+}
+
+async function onPonsV2Launch(log) {
+  if (!markEventOnce(log, 'pons-v2')) return;
+  const { token, curve, deployer, pairToken } = log.args;
+  const ctx = await blockContext(log.blockNumber);
+  const [m, q] = await Promise.all([tokenMeta(token), quoteMeta(pairToken)]);
+  const s = ensureState(token, { symbol: m.symbol, source: 'Pons V2', deployer, pair: safeAddress(curve), quoteToken: safeAddress(pairToken), quoteSymbol: q.symbol, curve: safeAddress(curve), trustedPons: true, dexVersion: 'Curve', discoveryBlock: log.blockNumber });
+  console.log('[DISCOVERY] Pons V2', m.symbol, token, 'curve', curve, `lag=${ctx.age_seconds}s`);
+  await post('TOKEN_DISCOVERED', {
+    ...ctx, block_number: Number(log.blockNumber), tx_hash: log.transactionHash,
+    token_ca: safeAddress(token), symbol: m.symbol, source: 'Pons V2', launchpad: 'Pons V2', deployer: safeAddress(deployer),
+    pair: safeAddress(curve), quote_token: safeAddress(pairToken), quote_symbol: q.symbol, stock_pair: q.stock_pair,
+    mechanism_tags: q.stock_pair === '待识别' ? 'custom-pair,curve' : 'curve', dex_version: 'Curve', discovery_tx: log.transactionHash, stage: 'Discovery'
+  });
+  await watchCurve(curve, token, m.symbol, q).catch(e => { lastError = String(e?.message || e); });
+  await backfillLaunchCurve(curve, token, m.symbol, q, log.blockNumber, log.transactionHash).catch(() => {});
+  scheduleSnapshots(token);
+  s.discoveredAt = Date.now();
+}
+
+async function watchV3Pool(pool, token, symbol, q) {
+  const key = lc(pool);
+  const [t0, t1] = await Promise.all([
+    httpClient.readContract({ address: safeAddress(pool), abi: v3PoolAbi, functionName: 'token0' }),
+    httpClient.readContract({ address: safeAddress(pool), abi: v3PoolAbi, functionName: 'token1' })
+  ]);
+  const tokenIs0 = lc(t0) === lc(token);
+  ensureState(token, { tokenIs0 });
+  if (!watchedPools.has(key)) {
+    watchedPools.add(key);
+    const unwatch = liveClient.watchContractEvent({
+      address: safeAddress(pool), event: v3Swap,
+      onLogs: logs => processV3Logs(logs, pool, token, symbol, q, tokenIs0).catch(e => { lastError = `pool logs ${pool}: ${String(e?.message || e)}`; }),
+      onError: e => { lastError = `pool ${pool}: ${String(e?.message || e)}`; }
+    });
+    if (typeof unwatch === 'function') unwatchers.push(unwatch);
+  }
+  return tokenIs0;
+}
+
+async function watchCurve(curve, token, symbol, q) {
+  const key = lc(curve); if (watchedCurves.has(key)) return;
+  watchedCurves.add(key);
+  const u1 = liveClient.watchContractEvent({ address: safeAddress(curve), event: curveBuy, onLogs: logs => processCurveLogs(logs, curve, token, symbol, q, 'buy').catch(() => {}), onError: e => { lastError = `curve buy ${curve}: ${String(e?.message || e)}`; } });
+  const u2 = liveClient.watchContractEvent({ address: safeAddress(curve), event: curveSell, onLogs: logs => processCurveLogs(logs, curve, token, symbol, q, 'sell').catch(() => {}), onError: e => { lastError = `curve sell ${curve}: ${String(e?.message || e)}`; } });
+  if (typeof u1 === 'function') unwatchers.push(u1);
+  if (typeof u2 === 'function') unwatchers.push(u2);
+}
+
+async function onGenericV3Pool(log) {
+  if (!markEventOnce(log, 'v3-pool-created')) return;
+  const { token0, token1, pool } = log.args;
+  const a0 = lc(token0), a1 = lc(token1);
+  const stock0 = stockTokens.get(a0) || '';
+  const stock1 = stockTokens.get(a1) || '';
+
+  let token = '', q = null;
+  if (a0 === WETH) {
+    token = token1; q = { address: ADDR.WETH, symbol: 'WETH', decimals: 18, stock_pair: '否' };
+  } else if (a1 === WETH) {
+    token = token0; q = { address: ADDR.WETH, symbol: 'WETH', decimals: 18, stock_pair: '否' };
+  } else if (a0 === USDG) {
+    token = token1; q = { address: ADDR.USDG, symbol: 'USDG', decimals: 18, stock_pair: '否' };
+  } else if (a1 === USDG) {
+    token = token0; q = { address: ADDR.USDG, symbol: 'USDG', decimals: 18, stock_pair: '否' };
+  } else if (stock0 && !stock1) {
+    token = token1; q = { address: token0, symbol: stock0, decimals: 18, stock_pair: '是' };
+  } else if (stock1 && !stock0) {
+    token = token0; q = { address: token1, symbol: stock1, decimals: 18, stock_pair: '是' };
+  } else {
+    return; // v1 只收可信 quote：WETH、USDG、官方 Stock Token
+  }
+
+  // 两边都是已知基础资产时不建立新币候选。
+  if (stockTokens.has(lc(token)) || lc(token) === WETH || lc(token) === USDG) return;
+  if (state.has(lc(token))) return;
+
+  const ctx = await blockContext(log.blockNumber);
+  const m = await tokenMeta(token);
+  ensureState(token, { symbol: m.symbol, source: 'Uni V3 PoolCreated', pair: safeAddress(pool), quoteToken: q.address, quoteSymbol: q.symbol, dexVersion: 'V3', discoveryBlock: log.blockNumber });
+  console.log('[DISCOVERY] Uni V3', m.symbol, token, '/', q.symbol, pool, `lag=${ctx.age_seconds}s`);
+  await post('POOL_CREATED', {
+    ...ctx, block_number: Number(log.blockNumber), tx_hash: log.transactionHash,
+    token_ca: safeAddress(token), symbol: m.symbol, source: 'Uni V3', launchpad: 'Direct/Unknown',
+    pair: safeAddress(pool), quote_token: safeAddress(q.address), quote_symbol: q.symbol,
+    stock_pair: q.stock_pair, mechanism_tags: q.stock_pair === '是' ? `Stock Token pair:${q.symbol}` : '', dex_version: 'V3', discovery_tx: log.transactionHash
+  });
+  const tokenIs0 = await watchV3Pool(pool, token, m.symbol, q).catch(() => null);
+  if (tokenIs0 != null) await backfillLaunchV3(pool, token, m.symbol, q, tokenIs0, log.blockNumber, log.transactionHash).catch(() => {});
+  scheduleSnapshots(token);
+}
+
+async function processV4Logs(logs) {
+  for (const log of logs) {
+    const id = lc(log.args.id);
+    const meta = v4Pools.get(id);
+    if (!meta) continue;
+    const tokenAmt = meta.tokenIs0 ? log.args.amount0 : log.args.amount1;
+    await recordTrade({ token: meta.token, symbol: meta.symbol, pair: ADDR.V4_POOL_MANAGER, q: meta.q, log, direction: tokenAmt < 0n ? 'buy' : 'sell' });
+  }
+}
+
+async function backfillLaunchV4(poolId, blockNumber, txHash) {
+  if (blockNumber == null || !txHash) return;
+  const logs = await httpClient.getLogs({
+    address: ADDR.V4_POOL_MANAGER, event: v4Swap, args: { id: poolId }, fromBlock: blockNumber, toBlock: blockNumber
+  }).catch(() => []);
+  const sameTx = logs.filter(x => lc(x.transactionHash) === lc(txHash));
+  if (sameTx.length) await processV4Logs(sameTx);
+}
+
+async function onGenericV4Pool(log) {
+  if (!markEventOnce(log, 'v4-initialize')) return;
+  const { id, currency0, currency1, hooks, fee, tickSpacing } = log.args;
+  const a0 = lc(currency0), a1 = lc(currency1);
+  const z = lc(zeroAddress);
+  const stock0 = stockTokens.get(a0
