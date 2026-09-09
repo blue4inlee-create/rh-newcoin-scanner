@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node rh_newcoin_scanner_v1.mjs"
+    "start": "node --import ./src/preload.mjs rh_newcoin_scanner_v1.mjs"
   },
   "dependencies": {
     "dotenv": "^16.6.1",
