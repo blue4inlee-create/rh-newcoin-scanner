@@ -7,8 +7,8 @@
     "start": "cat src/rh_newcoin_scanner_v1.part* > rh_newcoin_scanner_v1.mjs && node --check rh_newcoin_scanner_v1.mjs && node --import ./src/preload.mjs rh_newcoin_scanner_v1.mjs"
   },
   "dependencies": {
-    "dotenv": "^16.6.1",
-    "viem": "^2.37.3"
+    "dotenv": "16.6.1",
+    "viem": "2.37.3"
   },
   "engines": {
     "node": ">=20"
