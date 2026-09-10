@@ -1,6 +1,6 @@
 import { persistToken, persistSnapshot, persistEvent } from './db.mjs';
 
-const RPC = process.env.RH_HTTP_URL || 'https://rpc.mainnet.chain.robinhood.com';
+const RPC = process.env.LIVE_PROBE_RPC || process.env.RH_HTTP_URL || 'https://rpc.mainnet.chain.robinhood.com';
 const ENABLED = process.env.LIVE_CURVE_PROBE === '1';
 const ZERO = '0x0000000000000000000000000000000000000000';
 const PONS_V2_FACTORY = '0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e';
@@ -8,7 +8,7 @@ const PONS_V2_TOPIC = '0x8d4aad4953d0ca700d468f3753aa14432d1b35b43ec6409f051fb6a
 const MAX_DISCOVERY_AGE_S = 60;
 const CALL_GAP_MS = 450;
 const POLL_MS = 1500;
-const MAX_LOG_BLOCKS = 200n;
+const MAX_LOG_BLOCKS = 8n;
 
 const SEL = {
   getReserves: '0x0902f1ac',
