@@ -54,8 +54,9 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 setInterval(() => {
   post('HEARTBEAT', {
     event_time: nowIso(), ok: true, latest_block: Number(latestBlock || 0n),
-    ws_provider: WS_URL ? (WS_URL.includes('alchemy.com') ? 'Alchemy WebSocket' : 'Custom WebSocket') : 'Public HTTP polling', ws_status: 'connected',
-    event_lag_seconds: Number(lastLag.toFixed(2)), reconnect_count: reconnectCount, queue_size: queueSize,
+    ws_provider: WS_URL ? (WS_URL.includes('alchemy.com') ? 'Alchemy WebSocket' : 'Custom WebSocket') : 'Public HTTP polling',
+    ws_status: WS_URL ? 'connected' : 'polling',
+    event_lag_seconds: Number(lastLag.toFixed(2)), reconnect_count: WS_URL ? reconnectCount : 0, queue_size: queueSize,
     last_discovery_write: lastDiscoveryWrite, last_error: lastError, scanner_version: VERSION,
     pools_trade_current_listener: '正常', pools_trade_original_listener: '正常',
     pons_current_listener: '正常', pons_v2_listener: '正常', v3_listener: '正常', v4_listener: '正常'
@@ -70,6 +71,13 @@ await refreshStockRegistry();
 setInterval(refreshStockRegistry, 60 * 60 * 1000).unref?.();
 startWatchers();
 await backfillRecent();
-await post('HEARTBEAT', { event_time: nowIso(), ok: true, latest_block: Number(latestBlock || 0n), ws_provider: WS_URL ? (WS_URL.includes('alchemy.com') ? 'Alchemy WebSocket' : 'Custom WebSocket') : 'Public HTTP polling', ws_status: 'connected', reconnect_count: reconnectCount, queue_size: queueSize, scanner_version: VERSION }).catch(() => {});
+await post('HEARTBEAT', {
+  event_time: nowIso(), ok: true, latest_block: Number(latestBlock || 0n),
+  ws_provider: WS_URL ? (WS_URL.includes('alchemy.com') ? 'Alchemy WebSocket' : 'Custom WebSocket') : 'Public HTTP polling',
+  ws_status: WS_URL ? 'connected' : 'polling',
+  reconnect_count: WS_URL ? reconnectCount : 0,
+  queue_size: queueSize,
+  scanner_version: VERSION
+}).catch(() => {});
 ready = true;
 console.log('watchers active');
