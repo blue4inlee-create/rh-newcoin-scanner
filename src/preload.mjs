@@ -1,12 +1,13 @@
 // Preload patch for Google Apps Script ContentService webhooks.
-// Step 5: initialize SQLite and asynchronously probe fresh Pons V2 Curves into SQLite.
+// Step 5: initialize SQLite and run a raw Pons V2 factory poller + Curve Probe into SQLite.
 import { initDb } from './db.mjs';
-import { queueLiveCurveProbe } from './live_curve_probe.mjs';
+import { queueLiveCurveProbe, startLivePonsPoller } from './live_curve_probe.mjs';
 
 const nativeFetch = globalThis.fetch.bind(globalThis);
 const TRACKED_STAGES = new Set(['Canary', 'Early Alpha', 'Confirmed Alpha', 'Size-up']);
 
 initDb();
+startLivePonsPoller();
 
 async function followAppsScriptRedirect(res) {
   if (res.status >= 300 && res.status < 400) {
