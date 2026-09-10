@@ -1,10 +1,11 @@
 // Preload patch for Google Apps Script ContentService webhooks.
-// Adds SQLite-first persistence for discovery events before forwarding to Sheets.
-import { persistDiscovery } from './db.mjs';
+// Step 3: initialize SQLite on the Railway volume, but do not persist live scanner events yet.
+import { initDb } from './db.mjs';
 
 const nativeFetch = globalThis.fetch.bind(globalThis);
 const TRACKED_STAGES = new Set(['Canary', 'Early Alpha', 'Confirmed Alpha', 'Size-up']);
-const DISCOVERY_EVENTS = new Set(['TOKEN_DISCOVERED', 'POOL_CREATED']);
+
+initDb();
 
 async function followAppsScriptRedirect(res) {
   if (res.status >= 300 && res.status < 400) {
@@ -72,15 +73,6 @@ globalThis.fetch = async function patchedFetch(input, init) {
   let payload = null;
   if (typeof init?.body === 'string') {
     try { payload = JSON.parse(init.body); } catch {}
-  }
-
-  if (payload && DISCOVERY_EVENTS.has(String(payload.event_type || '').toUpperCase())) {
-    const saved = persistDiscovery(payload);
-    if (saved?.ok) {
-      console.log('[sqlite-first]', payload.event_type, payload.symbol || '', payload.token_ca || '', saved.pool_key || '');
-    } else {
-      console.error('[sqlite-first] failed', payload.event_type, payload.token_ca || '', saved?.error || 'unknown error');
-    }
   }
 
   const opts = { ...(init || {}), redirect: 'manual' };
