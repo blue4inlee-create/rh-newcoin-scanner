@@ -23,13 +23,37 @@ async function backfillRecent() {
   console.log(`[backfill] blocks ${from}-${head}, sources=${results.length}, failed=${failed.length}, rpcGapMs=${BACKFILL_RPC_GAP_MS}`);
 }
 
+// Runtime status version matches package.json. The split source still contains the
+// older const VERSION in part01; use this value for health/status until the next
+// source re-pack, so production observability is unambiguous.
+const STATUS_VERSION = 'rh-newcoin-scanner-v1.6.4';
+
+// Recover from stale webhook errors. rawPost records a webhook failure in
+// lastError. Once any later webhook succeeds, that old webhook-only error is no
+// longer current and must not be replayed by every 30s HEARTBEAT. Non-webhook
+// errors (RPC, holders, pool listeners, etc.) remain untouched.
+const rawPost = post;
+post = async function(event_type, body = {}) {
+  if (typeof event_type !== 'string' || !event_type.trim()) {
+    throw new Error('event_type is required and must be a non-empty string');
+  }
+  const result = await rawPost(event_type, body);
+  if (
+    lastError.startsWith('Webhook HTTP ') ||
+    lastError.startsWith('Webhook rejected:')
+  ) {
+    lastError = '';
+  }
+  return result;
+};
+
 const healthServer = createServer((req, res) => {
   if (req.url !== '/health' && req.url !== '/') {
     res.writeHead(404, { 'content-type': 'application/json' });
     return res.end(JSON.stringify({ ok: false, error: 'not_found' }));
   }
   const body = {
-    ok: ready, version: VERSION, chain_id: CHAIN_ID, latest_block: Number(latestBlock || 0n),
+    ok: ready, version: STATUS_VERSION, chain_id: CHAIN_ID, latest_block: Number(latestBlock || 0n),
     mode: WS_URL ? 'websocket' : 'http-polling', dry_run: DRY_RUN, webhook_ok: webhookOk,
     event_lag_seconds: Number(lastLag.toFixed(2)), queue_size: queueSize,
     tracked_tokens: state.size, watched_pools: watchedPools.size, watched_curves: watchedCurves.size, watched_v4_pools: v4Pools.size,
@@ -57,7 +81,7 @@ setInterval(() => {
     ws_provider: WS_URL ? (WS_URL.includes('alchemy.com') ? 'Alchemy WebSocket' : 'Custom WebSocket') : 'Public HTTP polling',
     ws_status: WS_URL ? 'connected' : 'polling',
     event_lag_seconds: Number(lastLag.toFixed(2)), reconnect_count: WS_URL ? reconnectCount : 0, queue_size: queueSize,
-    last_discovery_write: lastDiscoveryWrite, last_error: lastError, scanner_version: VERSION,
+    last_discovery_write: lastDiscoveryWrite, last_error: lastError, scanner_version: STATUS_VERSION,
     pools_trade_current_listener: '正常', pools_trade_original_listener: '正常',
     pons_current_listener: '正常', pons_v2_listener: '正常', v3_listener: '正常', v4_listener: '正常'
   }).catch(() => {});
@@ -66,7 +90,7 @@ setInterval(() => {
 process.on('unhandledRejection', e => { lastError = `unhandledRejection: ${String(e)}`; console.error(lastError); });
 process.on('uncaughtException', e => { lastError = `uncaughtException: ${String(e?.stack || e)}`; console.error(lastError); });
 
-console.log(`${VERSION} starting on chain ${CHAIN_ID} mode=${DRY_RUN ? 'DRY_RUN' : 'LIVE'}`);
+console.log(`${STATUS_VERSION} starting on chain ${CHAIN_ID} mode=${DRY_RUN ? 'DRY_RUN' : 'LIVE'}`);
 await refreshStockRegistry();
 setInterval(refreshStockRegistry, 60 * 60 * 1000).unref?.();
 startWatchers();
@@ -77,7 +101,7 @@ await post('HEARTBEAT', {
   ws_status: WS_URL ? 'connected' : 'polling',
   reconnect_count: WS_URL ? reconnectCount : 0,
   queue_size: queueSize,
-  scanner_version: VERSION
+  scanner_version: STATUS_VERSION
 }).catch(() => {});
 ready = true;
 console.log('watchers active');
