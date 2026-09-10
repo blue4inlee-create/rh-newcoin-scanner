@@ -1,15 +1,10 @@
 // Preload patch for Google Apps Script ContentService webhooks.
-// Apps Script executes the POST, then returns a 302 to script.googleusercontent.com.
-// Node fetch can mishandle that redirect for POST requests. Keep the POST redirect manual,
-// then explicitly GET the trusted ContentService Location so the scanner receives the real
-// JSON response, including any { ok:false } error returned by Apps Script.
-//
-// Production redundancy: after a successful STAGE_CHANGE into a tracked alpha stage,
-// mirror the same payload as CANARY_TRACK. Apps Script already attempts this internally,
-// but the explicit mirror makes Canary tracking resilient and remains CA-deduped.
+// Adds SQLite-first persistence for discovery events before forwarding to Sheets.
+import { persistDiscovery } from './db.mjs';
 
 const nativeFetch = globalThis.fetch.bind(globalThis);
 const TRACKED_STAGES = new Set(['Canary', 'Early Alpha', 'Confirmed Alpha', 'Size-up']);
+const DISCOVERY_EVENTS = new Set(['TOKEN_DISCOVERED', 'POOL_CREATED']);
 
 async function followAppsScriptRedirect(res) {
   if (res.status >= 300 && res.status < 400) {
@@ -77,6 +72,15 @@ globalThis.fetch = async function patchedFetch(input, init) {
   let payload = null;
   if (typeof init?.body === 'string') {
     try { payload = JSON.parse(init.body); } catch {}
+  }
+
+  if (payload && DISCOVERY_EVENTS.has(String(payload.event_type || '').toUpperCase())) {
+    const saved = persistDiscovery(payload);
+    if (saved?.ok) {
+      console.log('[sqlite-first]', payload.event_type, payload.symbol || '', payload.token_ca || '', saved.pool_key || '');
+    } else {
+      console.error('[sqlite-first] failed', payload.event_type, payload.token_ca || '', saved?.error || 'unknown error');
+    }
   }
 
   const opts = { ...(init || {}), redirect: 'manual' };
