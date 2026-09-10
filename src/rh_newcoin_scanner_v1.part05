@@ -51,7 +51,9 @@
 function startWatchers() {
   const specs = [
     [ADDR.POOLS_TRADE_CURRENT, poolsTradeTokenCreated, logs => Promise.all(logs.map(l => onPoolsTradeTokenCreated(l, 'Current')))],
-    [ADDR.POOLS_TRADE_ORIGINAL, poolsTradeTokenCreated, logs => Promise.all(logs.map(l => onPoolsTradeTokenCreated(l, 'Original')))],
+    // Original pools.trade launcher is retained in startup backfill below, but its
+    // live watcher is disabled because it is inactive and was producing a viem
+    // HTTP-polling error without adding current launch coverage.
     [ADDR.PONS_CURRENT, ponsV1Launch, logs => Promise.all(logs.map(l => onPonsV1Launch(l, 'Pons Current')))],
     [ADDR.PONS_LEGACY, ponsV1Launch, logs => Promise.all(logs.map(l => onPonsV1Launch(l, 'Pons Legacy')))],
     [ADDR.PONS_V2, ponsV2Launch, logs => Promise.all(logs.map(onPonsV2Launch))],
