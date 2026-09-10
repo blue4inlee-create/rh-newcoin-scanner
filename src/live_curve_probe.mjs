@@ -1,10 +1,14 @@
-import { persistToken, persistSnapshot } from './db.mjs';
+import { persistToken, persistSnapshot, persistEvent } from './db.mjs';
 
 const RPC = process.env.RH_HTTP_URL || 'https://rpc.mainnet.chain.robinhood.com';
 const ENABLED = process.env.LIVE_CURVE_PROBE === '1';
 const ZERO = '0x0000000000000000000000000000000000000000';
+const PONS_V2_FACTORY = '0x7ed598bcef8bd9edd8c97a195c6d13f40801ec7e';
+const PONS_V2_TOPIC = '0x8d4aad4953d0ca700d468f3753aa14432d1b35b43ec6409f051fb6aa43a89607';
 const MAX_DISCOVERY_AGE_S = 60;
 const CALL_GAP_MS = 450;
+const POLL_MS = 1500;
+const MAX_LOG_BLOCKS = 200n;
 
 const SEL = {
   getReserves: '0x0902f1ac',
@@ -15,12 +19,17 @@ const SEL = {
   pairToken: '0x3de35b79',
   totalSupply: '0x18160ddd',
   decimals: '0x313ce567',
+  symbol: '0x95d89b41',
 };
 
 const queue = [];
 const queued = new Set();
+const completed = new Set();
 let working = false;
 let rpc429 = 0;
+let rawCursor = null;
+let rawPollStarted = false;
+const blockTimeCache = new Map();
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const lc = v => String(v || '').toLowerCase();
@@ -52,6 +61,7 @@ function word(hex, i = 0) {
   return BigInt('0x' + hex.slice(2 + i * 64, 2 + (i + 1) * 64));
 }
 function addr(hex) { return '0x' + hex.slice(-40).toLowerCase(); }
+function topicAddr(hex) { return '0x' + String(hex || '').slice(-40).toLowerCase(); }
 function bool(hex) { return word(hex) !== 0n; }
 function pow10(n) { return 10n ** BigInt(n); }
 function fmt(raw, dec, places = 18) {
@@ -67,6 +77,31 @@ function ratio(num, den, precision = 24) {
   const s = q.toString().padStart(precision + 1, '0');
   return `${s.slice(0, -precision)}.${s.slice(-precision)}`.replace(/\.0+$/, '').replace(/(\.\d*?)0+$/, '$1');
 }
+function decodeAbiString(hex) {
+  try {
+    const body = String(hex || '').replace(/^0x/, '');
+    if (body.length < 64) return '';
+    const offset = Number(BigInt('0x' + body.slice(0, 64)));
+    if (offset >= 0 && offset * 2 + 64 <= body.length) {
+      const lenPos = offset * 2;
+      const len = Number(BigInt('0x' + body.slice(lenPos, lenPos + 64)));
+      const data = body.slice(lenPos + 64, lenPos + 64 + len * 2);
+      if (data) return Buffer.from(data, 'hex').toString('utf8').replace(/\0/g, '').trim();
+    }
+    return Buffer.from(body.slice(0, 64), 'hex').toString('utf8').replace(/\0/g, '').trim();
+  } catch {
+    return '';
+  }
+}
+async function readSymbol(address, fallback = '') {
+  if (lc(address) === ZERO) return 'ETH';
+  try {
+    const s = decodeAbiString(await call(address, SEL.symbol));
+    return s || fallback;
+  } catch {
+    return fallback;
+  }
+}
 
 function eventAgeSeconds(payload) {
   const direct = Number(payload?.age_seconds);
@@ -76,12 +111,25 @@ function eventAgeSeconds(payload) {
   return 0;
 }
 
+async function blockEventTime(blockHex) {
+  const key = lc(blockHex);
+  if (blockTimeCache.has(key)) return blockTimeCache.get(key);
+  const b = await rpc('eth_getBlockByNumber', [blockHex, false]);
+  const iso = b?.timestamp ? new Date(Number(BigInt(b.timestamp)) * 1000).toISOString() : nowIso();
+  blockTimeCache.set(key, iso);
+  if (blockTimeCache.size > 1000) {
+    const first = blockTimeCache.keys().next().value;
+    blockTimeCache.delete(first);
+  }
+  return iso;
+}
+
 async function probe(payload) {
   const started = Date.now();
   const token = lc(payload.token_ca);
   const curve = lc(payload.pair || payload.curve);
-  const symbol = String(payload.symbol || '');
-  const quoteSymbol = String(payload.quote_symbol || payload.quote || '');
+  let symbol = String(payload.symbol || '');
+  let quoteSymbol = String(payload.quote_symbol || payload.quote || '');
   const initialAge = eventAgeSeconds(payload);
 
   if (!token || !curve) throw new Error('missing token or curve');
@@ -97,6 +145,8 @@ async function probe(payload) {
   const supplyRaw = word(await call(token, SEL.totalSupply));
   const tokenDec = Number(word(await call(token, SEL.decimals)));
   const quoteDec = pair === ZERO ? 18 : Number(word(await call(pair, SEL.decimals)));
+  if (!symbol) symbol = await readSymbol(token, token.slice(0, 10));
+  if (!quoteSymbol) quoteSymbol = pair === ZERO ? 'ETH' : await readSymbol(pair, pair.slice(0, 10));
 
   const q = fmt(qRaw, quoteDec, quoteDec);
   const t = fmt(tRaw, tokenDec, tokenDec);
@@ -154,9 +204,23 @@ async function probe(payload) {
     discovery_age_seconds: initialAge,
   }, 'LIVE_CURVE_DISCOVERY');
 
+  persistEvent({
+    event_type: 'LIVE_CURVE_DISCOVERY',
+    token_ca: token,
+    tx_hash: payload.discovery_tx || payload.tx_hash || '',
+    log_index: payload.log_index ?? -1,
+    block_number: payload.block_number ?? null,
+    event_time: capturedAt,
+    source: payload.discovery_source || 'Pons V2',
+    price_quote: price || '',
+    market_cap_quote: mc || '',
+    curve_progress: progress,
+  });
+
   const probeMs = Date.now() - started;
   const totalAge = initialAge + probeMs / 1000;
   console.log(`[LIVE-CURVE] PASS ${symbol || token} ca=${token} quote=${quoteSymbol || pair} qdec=${quoteDec} price=${price ?? 'N/A'} mc=${mc ?? 'N/A'} progress=${progressStr ?? 'N/A'}% discovery_age=${initialAge.toFixed(2)}s probe_ms=${probeMs} total_age=${totalAge.toFixed(2)}s db_inserted=${saved.inserted} rpc429=${rpc429}`);
+  return { token, symbol, quoteSymbol, price, mc, progress, totalAge, saved };
 }
 
 async function drain() {
@@ -168,6 +232,11 @@ async function drain() {
       const key = `${lc(payload.token_ca)}:${lc(payload.discovery_tx || payload.tx_hash)}`;
       try {
         await probe(payload);
+        completed.add(key);
+        if (completed.size > 5000) {
+          const first = completed.values().next().value;
+          completed.delete(first);
+        }
       } catch (err) {
         console.error(`[LIVE-CURVE] FAIL ${payload.symbol || payload.token_ca || ''} ca=${lc(payload.token_ca)} ${String(err?.message || err)}`);
       } finally {
@@ -186,10 +255,96 @@ export function queueLiveCurveProbe(payload = {}) {
   if (eventAgeSeconds(payload) > MAX_DISCOVERY_AGE_S) return { queued: false, reason: 'stale' };
 
   const key = `${lc(payload.token_ca)}:${lc(payload.discovery_tx || payload.tx_hash)}`;
-  if (!payload.token_ca || !payload.pair || queued.has(key)) return { queued: false, reason: 'duplicate_or_missing' };
+  if (!payload.token_ca || !payload.pair || queued.has(key) || completed.has(key)) return { queued: false, reason: 'duplicate_or_missing' };
   queued.add(key);
   queue.push({ ...payload });
   queueMicrotask(() => { drain().catch(err => console.error('[LIVE-CURVE] drain failed', String(err?.message || err))); });
   console.log(`[LIVE-CURVE] QUEUED ${payload.symbol || ''} ${lc(payload.token_ca)} age=${eventAgeSeconds(payload).toFixed(2)}s depth=${queue.length}`);
   return { queued: true };
+}
+
+async function processRawPonsLog(log) {
+  if (!Array.isArray(log?.topics) || log.topics.length < 4) return;
+  const token = topicAddr(log.topics[1]);
+  const curve = topicAddr(log.topics[2]);
+  const deployer = topicAddr(log.topics[3]);
+  const pairToken = addr(String(log.data || '').slice(0, 66));
+  const eventTime = await blockEventTime(log.blockNumber);
+  const age = Math.max(0, (Date.now() - Date.parse(eventTime)) / 1000);
+  const blockNumber = Number(BigInt(log.blockNumber));
+  const logIndex = Number(BigInt(log.logIndex || '0x0'));
+
+  persistToken({
+    token_ca: token,
+    source: 'Pons V2',
+    launchpad: 'Pons V2',
+    curve,
+    quote_token: pairToken,
+    block_number: blockNumber,
+    first_seen_at: eventTime,
+    deployer,
+    status: 'Discovery',
+  });
+
+  console.log(`[LIVE-PONS] RAW token=${token} curve=${curve} pair=${pairToken} block=${blockNumber} age=${age.toFixed(2)}s tx=${log.transactionHash}`);
+  queueLiveCurveProbe({
+    event_type: 'TOKEN_DISCOVERED',
+    event_time: eventTime,
+    age_seconds: age,
+    block_number: blockNumber,
+    log_index: logIndex,
+    tx_hash: log.transactionHash,
+    discovery_tx: log.transactionHash,
+    token_ca: token,
+    pair: curve,
+    curve,
+    deployer,
+    quote_token: pairToken,
+    source: 'Pons V2',
+    launchpad: 'Pons V2',
+    dex_version: 'Curve',
+    stage: 'Discovery',
+    discovery_source: 'raw-factory-poll',
+  });
+}
+
+async function rawPollOnce() {
+  const latestHex = await rpc('eth_blockNumber', []);
+  const latest = BigInt(latestHex);
+  if (rawCursor == null) {
+    rawCursor = latest;
+    console.log(`[LIVE-PONS] START rpc=${RPC} cursor=${rawCursor}`);
+    return;
+  }
+  if (latest <= rawCursor) return;
+
+  let from = rawCursor + 1n;
+  while (from <= latest) {
+    const to = from + MAX_LOG_BLOCKS - 1n > latest ? latest : from + MAX_LOG_BLOCKS - 1n;
+    const logs = await rpc('eth_getLogs', [{
+      address: PONS_V2_FACTORY,
+      topics: [PONS_V2_TOPIC],
+      fromBlock: '0x' + from.toString(16),
+      toBlock: '0x' + to.toString(16),
+    }]);
+    for (const log of logs || []) await processRawPonsLog(log);
+    rawCursor = to;
+    from = to + 1n;
+  }
+}
+
+export function startLivePonsPoller() {
+  if (!ENABLED || rawPollStarted) return;
+  rawPollStarted = true;
+  const loop = async () => {
+    try {
+      await rawPollOnce();
+    } catch (err) {
+      console.error('[LIVE-PONS] POLL_FAIL', String(err?.message || err));
+    } finally {
+      const timer = setTimeout(loop, POLL_MS);
+      timer.unref?.();
+    }
+  };
+  loop().catch(err => console.error('[LIVE-PONS] START_FAIL', String(err?.message || err)));
 }
