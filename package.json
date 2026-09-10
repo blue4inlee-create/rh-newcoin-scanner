@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "cat src/rh_newcoin_scanner_v1.part* > rh_newcoin_scanner_v1.mjs && echo 'a03ae7dda84e4db8322b912756c176911b419d2e7bdff968aedd4abb3909684c  rh_newcoin_scanner_v1.mjs' | sha256sum -c - && node --import ./src/preload.mjs rh_newcoin_scanner_v1.mjs"
+    "start": "cat src/rh_newcoin_scanner_v1.part* > rh_newcoin_scanner_v1.mjs && node --check rh_newcoin_scanner_v1.mjs && node --import ./src/preload.mjs rh_newcoin_scanner_v1.mjs"
   },
   "dependencies": {
     "dotenv": "^16.6.1",
