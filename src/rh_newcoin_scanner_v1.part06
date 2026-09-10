@@ -23,15 +23,146 @@ async function backfillRecent() {
   console.log(`[backfill] blocks ${from}-${head}, sources=${results.length}, failed=${failed.length}, rpcGapMs=${BACKFILL_RPC_GAP_MS}`);
 }
 
-// Runtime status version matches package.json. The split source still contains the
-// older const VERSION in part01; use this value for health/status until the next
-// source re-pack, so production observability is unambiguous.
-const STATUS_VERSION = 'rh-newcoin-scanner-v1.6.4';
+const STATUS_VERSION = 'rh-newcoin-scanner-v1.6.5';
 
-// Recover from stale webhook errors. rawPost records a webhook failure in
-// lastError. Once any later webhook succeeds, that old webhook-only error is no
-// longer current and must not be replayed by every 30s HEARTBEAT. Non-webhook
-// errors (RPC, holders, pool listeners, etc.) remain untouched.
+// Public Robinhood RPC explicitly returns messages such as
+// "Rate Limit Hit, limit will reset in 60 seconds". Short retries only burn the
+// remaining quota, so startup/backfill honors the advertised reset window.
+function publicRpcRateLimitWaitMs_(err, attempt) {
+  const text = String(err?.message || err || '');
+  const isLimited = isRateLimitError(err) || /Rate Limit Hit|rate.?limit|reset in\s+\d+\s*seconds/i.test(text);
+  if (!isLimited) return 0;
+  const m = text.match(/reset in\s+(\d+)\s*seconds/i);
+  if (m) return Math.min(70_000, (Number(m[1]) + 2) * 1000);
+  return [5_000, 15_000, 30_000, 60_000][Math.min(attempt, 3)];
+}
+
+backfillGetLogs = async function(args, label = 'getLogs') {
+  let last;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const out = await httpClient.getLogs(args);
+      if (BACKFILL_RPC_GAP_MS > 0) await sleep(BACKFILL_RPC_GAP_MS);
+      return out;
+    } catch (err) {
+      last = err;
+      const waitMs = publicRpcRateLimitWaitMs_(err, attempt);
+      if (!waitMs || attempt === 3) throw err;
+      console.warn(`[backfill-rate-limit] ${label} wait=${Math.round(waitMs / 1000)}s retry=${attempt + 1}`);
+      await sleep(waitMs);
+    }
+  }
+  throw last;
+};
+
+// Same-block Pons V2 first-trade check. During startup it uses the throttled
+// backfill path. In steady state it makes one immediate Buy query first; most
+// launches with an initial buy therefore never need a long-lived curve watcher.
+backfillLaunchCurve = async function(curve, token, symbol, q, blockNumber, txHash) {
+  if (blockNumber == null || !txHash) return;
+  const getLogs = async (event, label) => {
+    const args = { address: safeAddress(curve), event, fromBlock: blockNumber, toBlock: blockNumber };
+    return ready ? httpClient.getLogs(args) : backfillGetLogs(args, label);
+  };
+
+  const buys = await getLogs(curveBuy, `${symbol || token}:launch-buy`).catch(() => []);
+  const sameBuys = Array.isArray(buys) ? buys.filter(x => lc(x.transactionHash) === lc(txHash)) : [];
+  if (sameBuys.length) {
+    await processCurveLogs(sameBuys, curve, token, symbol, q, 'buy');
+    return;
+  }
+
+  const sells = await getLogs(curveSell, `${symbol || token}:launch-sell`).catch(() => []);
+  const sameSells = Array.isArray(sells) ? sells.filter(x => lc(x.transactionHash) === lc(txHash)) : [];
+  if (sameSells.length) await processCurveLogs(sameSells, curve, token, symbol, q, 'sell');
+};
+
+// Keep no-trade Pons V2 curve watchers bounded. A curve watcher stops as soon as
+// the first trade is captured, or after 120 seconds if the launch remains idle.
+watchCurve = async function(curve, token, symbol, q) {
+  const key = lc(curve);
+  const s = ensureState(token);
+  if (s.firstTradeSent || watchedCurves.has(key)) return;
+
+  watchedCurves.add(key);
+  let uBuy = null;
+  let uSell = null;
+  let timer = null;
+  let stopped = false;
+
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    try { if (typeof uBuy === 'function') uBuy(); } catch {}
+    try { if (typeof uSell === 'function') uSell(); } catch {}
+    if (timer) clearTimeout(timer);
+    watchedCurves.delete(key);
+    if (s.curveWatchStop === stop) delete s.curveWatchStop;
+  };
+
+  const onBuyLogs = async logs => {
+    if (!Array.isArray(logs)) return;
+    await processCurveLogs(logs, curve, token, symbol, q, 'buy').catch(() => {});
+    if (lastError.startsWith(`curve buy ${curve}:`)) lastError = '';
+    if (s.firstTradeSent) stop();
+  };
+
+  const onSellLogs = async logs => {
+    if (!Array.isArray(logs)) return;
+    await processCurveLogs(logs, curve, token, symbol, q, 'sell').catch(() => {});
+    if (lastError.startsWith(`curve sell ${curve}:`)) lastError = '';
+    if (s.firstTradeSent) stop();
+  };
+
+  uBuy = liveClient.watchContractEvent({
+    address: safeAddress(curve), event: curveBuy, onLogs: onBuyLogs,
+    pollingInterval: WS_URL ? undefined : 3000,
+    onError: err => { lastError = `curve buy ${curve}: ${String(err?.message || err || 'unknown error')}`; }
+  });
+  uSell = liveClient.watchContractEvent({
+    address: safeAddress(curve), event: curveSell, onLogs: onSellLogs,
+    pollingInterval: WS_URL ? undefined : 3000,
+    onError: err => { lastError = `curve sell ${curve}: ${String(err?.message || err || 'unknown error')}`; }
+  });
+
+  if (typeof uBuy === 'function') unwatchers.push(uBuy);
+  if (typeof uSell === 'function') unwatchers.push(uSell);
+  s.curveWatchStop = stop;
+  timer = setTimeout(stop, 120_000);
+  timer.unref?.();
+};
+
+onPonsV2Launch = async function(log) {
+  if (!markEventOnce(log, 'pons-v2')) return;
+  const { token, curve, deployer, pairToken } = log.args || {};
+  if (!token || !curve) return;
+  const ctx = await blockContext(log.blockNumber);
+  const [m, q] = await Promise.all([tokenMeta(token), quoteMeta(pairToken)]);
+  const s = ensureState(token, {
+    symbol: m.symbol, source: 'Pons V2', deployer, pair: safeAddress(curve),
+    quoteToken: safeAddress(pairToken), quoteSymbol: q.symbol, curve: safeAddress(curve),
+    trustedPons: true, dexVersion: 'Curve', discoveryBlock: log.blockNumber
+  });
+  console.log('[DISCOVERY] Pons V2', m.symbol, token, 'curve', curve, `lag=${ctx.age_seconds}s`);
+  await post('TOKEN_DISCOVERED', {
+    ...ctx, block_number: Number(log.blockNumber), tx_hash: log.transactionHash,
+    token_ca: safeAddress(token), symbol: m.symbol, source: 'Pons V2', launchpad: 'Pons V2', deployer: safeAddress(deployer),
+    pair: safeAddress(curve), quote_token: safeAddress(pairToken), quote_symbol: q.symbol, stock_pair: q.stock_pair,
+    mechanism_tags: q.stock_pair === '待识别' ? 'custom-pair,curve' : 'curve', dex_version: 'Curve', discovery_tx: log.transactionHash, stage: 'Discovery'
+  });
+
+  await backfillLaunchCurve(curve, token, m.symbol, q, log.blockNumber, log.transactionHash).catch(err => {
+    lastError = `launch trade ${curve}: ${String(err?.message || err)}`;
+  });
+  if (!s.firstTradeSent) await watchCurve(curve, token, m.symbol, q).catch(err => {
+    lastError = `curve watch ${curve}: ${String(err?.message || err)}`;
+  });
+  scheduleSnapshots(token);
+  s.discoveredAt = Date.now();
+};
+
+// Recover from stale webhook errors. A later successful webhook clears only a
+// webhook-specific stale error; RPC/listener/holder errors remain visible.
 const rawPost = post;
 post = async function(event_type, body = {}) {
   if (typeof event_type !== 'string' || !event_type.trim()) {
@@ -82,8 +213,10 @@ setInterval(() => {
     ws_status: WS_URL ? 'connected' : 'polling',
     event_lag_seconds: Number(lastLag.toFixed(2)), reconnect_count: WS_URL ? reconnectCount : 0, queue_size: queueSize,
     last_discovery_write: lastDiscoveryWrite, last_error: lastError, scanner_version: STATUS_VERSION,
-    pools_trade_current_listener: '正常', pools_trade_original_listener: '正常',
-    pons_current_listener: '正常', pons_v2_listener: '正常', v3_listener: '正常', v4_listener: '正常'
+    pools_trade_current_listener: '正常', pools_trade_original_listener: '回补保留/实时停用',
+    pons_current_listener: '正常', pons_legacy_listener: '正常', pons_v2_listener: '正常',
+    pons_first_trade_listener: watchedCurves.size >= 0 ? '正常' : '警告',
+    v3_listener: '正常', v4_listener: '正常'
   }).catch(() => {});
 }, 30_000).unref?.();
 
@@ -93,8 +226,13 @@ process.on('uncaughtException', e => { lastError = `uncaughtException: ${String(
 console.log(`${STATUS_VERSION} starting on chain ${CHAIN_ID} mode=${DRY_RUN ? 'DRY_RUN' : 'LIVE'}`);
 await refreshStockRegistry();
 setInterval(refreshStockRegistry, 60 * 60 * 1000).unref?.();
-startWatchers();
+
+// Backfill first so startup does not stack seven live polling loops on top of the
+// historical scan. The head captured by backfillRecent remains in latestBlock;
+// once watchers start, their first poll covers blocks produced during startup.
 await backfillRecent();
+startWatchers();
+
 await post('HEARTBEAT', {
   event_time: nowIso(), ok: true, latest_block: Number(latestBlock || 0n),
   ws_provider: WS_URL ? (WS_URL.includes('alchemy.com') ? 'Alchemy WebSocket' : 'Custom WebSocket') : 'Public HTTP polling',
